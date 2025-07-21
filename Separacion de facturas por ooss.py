@@ -4,7 +4,6 @@ import re
 from io import BytesIO
 import zipfile
 import os
-from tempfile import TemporaryDirectory
 import traceback
 
 # Columnas a eliminar completamente
@@ -29,45 +28,45 @@ numeric_columns = [
 ]
 
 def clean_and_format_dataframe(df):
-    df.drop(columns=[col for col in columns_to_drop if col in df.columns], inplace=True)
-    df = df[[col for col in column_order if col in df.columns]]
-    for col in numeric_columns:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col].str.replace(',', '.'), errors='coerce')
+    df = df.drop(columns=[col for col in columns_to_drop if col in df.columns], errors='ignore')
     existing_columns = [col for col in column_order if col in df.columns]
     df = df[existing_columns + [col for col in df.columns if col not in existing_columns]]
+
+    for col in numeric_columns:
+        if col in df.columns:
+            if pd.api.types.is_string_dtype(df[col]):
+                df[col] = df[col].str.replace(',', '.', regex=False)
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
     return df
 
 def generate_zip_with_summary(df, folder_base):
     zip_buffer = BytesIO()
     safe_base = re.sub(r'\W+', '_', folder_base.strip()) or "Facturas"
 
-    with TemporaryDirectory() as temp_dir:
-        for cobertura, cobertura_group in df.groupby('COBERTURA'):
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        grouped = df.groupby(['COBERTURA', 'NRO.FACTURA'])
+
+        for (cobertura, factura), group in grouped:
             safe_cobertura = re.sub(r'\W+', '', str(cobertura))[:20]
-            cobertura_dir = os.path.join(temp_dir, safe_cobertura)
-            os.makedirs(cobertura_dir, exist_ok=True)
+            safe_factura = re.sub(r'\W+', '', str(factura))[:20]
+            filename = f"{safe_base}/{safe_cobertura}/Factura_{safe_factura}_{safe_cobertura}.xlsx"
 
-            for factura, factura_group in cobertura_group.groupby('NRO.FACTURA'):
-                safe_factura = re.sub(r'\W+', '', str(factura))[:20]
-                filename = f"Factura_{safe_factura}_{safe_cobertura}.xlsx"
-                filepath = os.path.join(cobertura_dir, filename)
-                factura_group = clean_and_format_dataframe(factura_group)
-                factura_group.to_excel(filepath, index=False, engine='openpyxl')
+            group = clean_and_format_dataframe(group)
+            excel_buffer = BytesIO()
+            group.to_excel(excel_buffer, index=False, engine='openpyxl')
+            excel_buffer.seek(0)
+            zipf.writestr(filename, excel_buffer.read())
 
+        # Resumen
         summary_df = (
             df.groupby(['COBERTURA', 'NRO.FACTURA', 'APELLIDO Y NOMBRE'], as_index=False)['IMPORTE PREST.']
             .sum(numeric_only=True)
         )
-        summary_path = os.path.join(temp_dir, "resumen_facturas.xlsx")
-        summary_df.to_excel(summary_path, index=False, engine='openpyxl')
-
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, _, files in os.walk(temp_dir):
-                for file in files:
-                    full_path = os.path.join(root, file)
-                    arcname = os.path.join(safe_base, os.path.relpath(full_path, temp_dir))
-                    zipf.write(full_path, arcname)
+        summary_buffer = BytesIO()
+        summary_df.to_excel(summary_buffer, index=False, engine='openpyxl')
+        summary_buffer.seek(0)
+        zipf.writestr(f"{safe_base}/resumen_facturas.xlsx", summary_buffer.read())
 
     zip_buffer.seek(0)
     return zip_buffer
@@ -83,18 +82,17 @@ def process_file(file, folder_base):
             st.error(f"Faltan las siguientes columnas requeridas: {', '.join(missing)}")
             return
 
-        for col in df.select_dtypes(include='object'):
-            df[col] = df[col].map(lambda x: x.strip() if isinstance(x, str) else x)
-
+        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
         df.dropna(how='all', inplace=True)
         df.sort_values(by='NRO.FACTURA', inplace=True)
-        df = clean_and_format_dataframe(df)
+
+        df_clean = clean_and_format_dataframe(df)
 
         output = BytesIO()
-        df.to_excel(output, index=False, engine='openpyxl')
+        df_clean.to_excel(output, index=False, engine='openpyxl')
         output.seek(0)
 
-        unique_invoices = df['NRO.FACTURA'].nunique()
+        unique_invoices = df_clean['NRO.FACTURA'].nunique()
         st.info(f"Se generarán {unique_invoices} archivos únicos por número de factura.")
 
         zip_output = generate_zip_with_summary(df, folder_base)
